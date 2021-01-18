@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::io::{Read, Write};
@@ -8,7 +10,7 @@ use clap::{App, Arg};
 use futures_util::future;
 use serde::{Deserialize, Serialize};
 
-use fluminurs::module::{Directory, FSObject, File, Module, OverwriteMode, OverwriteResult};
+use fluminurs::module::{DownloadableObject, File, Module, OverwriteMode, OverwriteResult};
 use fluminurs::{Api, Result};
 
 #[macro_use]
@@ -51,15 +53,6 @@ fn get_password(prompt: &str) -> String {
     rpassword::read_password().expect("Unable to get non-echo input mode for password")
 }
 
-fn print_files(dir: &Directory, prefix: &str) {
-    for fso in dir.children() {
-        match fso {
-            FSObject::File(f) => println!("{}/{}", prefix, f.name()),
-            FSObject::Directory(d) => print_files(d, &format!("{}/{}", prefix, d.name())),
-        }
-    }
-}
-
 async fn print_announcements(api: &Api, modules: &[Module]) -> Result<()> {
     let module_announcements = future::join_all(
         modules
@@ -91,14 +84,14 @@ async fn load_modules_files(
     api: &Api,
     modules: &[Module],
     include_uploadable_folders: ModuleTypeFlags,
-) -> Result<Vec<Directory>> {
+) -> Result<Vec<File>> {
     let root_dirs = modules
         .iter()
         .filter(|module| module.has_access())
         .map(|module| (module.workbin_root(), module.is_teaching()))
         .collect::<Vec<_>>();
 
-    let (dirs, errors) = future::join_all(root_dirs.into_iter().map(|(root_dir, is_teaching)| {
+    let (files, errors) = future::join_all(root_dirs.into_iter().map(|(root_dir, is_teaching)| {
         root_dir.load(
             api,
             include_uploadable_folders.contains(if is_teaching {
@@ -112,8 +105,8 @@ async fn load_modules_files(
     .into_iter()
     .fold((vec![], vec![]), move |(mut ok, mut err), res| {
         match res {
-            Ok(dir) => {
-                ok.push(dir);
+            Ok(mut dir) => {
+                ok.append(&mut dir);
             }
             Err(e) => {
                 err.push(e);
@@ -124,12 +117,12 @@ async fn load_modules_files(
     for e in errors {
         println!("Failed loading module files: {}", e);
     }
-    Ok(dirs)
+    Ok(files)
 }
 
-fn list_files(module_dirs: &[Directory]) {
-    for dir in module_dirs {
-        print_files(dir, "");
+fn list_files<T: DownloadableObject>(files: &[T]) {
+    for file in files {
+        println!("{}", file.path().display())
     }
 }
 
@@ -156,51 +149,33 @@ async fn download_file(
 
 async fn download_files(
     api: &Api,
-    module_dirs: &[Directory],
+    files: &[File],
     destination: &str,
     overwrite_mode: OverwriteMode,
 ) -> Result<()> {
     println!("Download to {}", destination);
-    let path = Path::new(destination).to_owned();
-    if !path.is_dir() {
+    let dest_path = Path::new(destination);
+    if !dest_path.is_dir() {
         return Err("Download destination does not exist or is not a directory");
     }
 
-    let mut directories = module_dirs
-        .iter()
-        .zip(std::iter::repeat(path))
-        .collect::<Vec<_>>();
-    let mut files: Vec<(&File, PathBuf, PathBuf)> = vec![];
-
-    while let Some((dir, path)) = directories.pop() {
-        let dir_path = path.join(dir.name());
-        directories.append(
-            &mut dir
-                .children()
-                .into_iter()
-                .filter_map(|fso| match fso {
-                    FSObject::File(f) => {
-                        let temp_path = dir_path.join(make_temp_file_name(f.name()));
-                        let real_path = dir_path.join(f.name());
-                        files.push((f, real_path, temp_path));
-                        None
-                    }
-                    FSObject::Directory(d) => Some((d, dir_path.clone())),
-                })
-                .collect(),
-        );
-    }
-    future::join_all(
-        files.into_iter().map(|(file, path, temp_path)| {
-            download_file(api, file, path, temp_path, overwrite_mode)
-        }),
-    )
+    future::join_all(files.iter().map(|file| {
+        let temp_path = dest_path
+            .join(file.path().parent().unwrap())
+            .join(make_temp_file_name(file.path().file_name().unwrap()));
+        let real_path = dest_path.join(file.path());
+        download_file(api, file, real_path, temp_path, overwrite_mode)
+    }))
     .await;
     Ok(())
 }
 
-fn make_temp_file_name(name: &str) -> String {
-    format!("~!{}", name)
+fn make_temp_file_name(name: &OsStr) -> OsString {
+    let prepend = OsStr::new("~!");
+    let mut res = OsString::with_capacity(prepend.len() + name.len());
+    res.push(prepend);
+    res.push(name);
+    res
 }
 
 fn get_credentials(credential_file: &str) -> Result<(String, String)> {
@@ -366,14 +341,14 @@ async fn main() -> Result<()> {
     }
 
     if do_files || download_destination.is_some() {
-        let module_dirs = load_modules_files(&api, &modules, include_uploadable_folders).await?;
+        let module_file = load_modules_files(&api, &modules, include_uploadable_folders).await?;
 
         if do_files {
-            list_files(&module_dirs);
+            list_files(&module_file);
         }
 
         if let Some(destination) = download_destination {
-            download_files(&api, &module_dirs, &destination, overwrite_mode).await?;
+            download_files(&api, &module_file, &destination, overwrite_mode).await?;
         }
     }
 
